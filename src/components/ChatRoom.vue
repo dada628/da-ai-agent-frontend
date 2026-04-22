@@ -29,11 +29,12 @@
             <template v-if="msg.role === 'ai' && !msg.content && msg.pending === 'waiting'">
               <span class="typing-dots"><i></i><i></i><i></i></span>
             </template>
+            <template v-else-if="msg.role === 'ai'">
+              <div class="bubble-text markdown" v-html="renderAi(msg.content)"></div>
+              <span v-if="msg.pending === 'streaming'" class="caret">▍</span>
+            </template>
             <template v-else>
-              <pre class="bubble-text">{{ msg.content }}<span
-                  v-if="msg.pending === 'streaming'"
-                  class="caret"
-                >▍</span></pre>
+              <pre class="bubble-text">{{ msg.content }}</pre>
             </template>
           </div>
           <div class="meta">{{ formatTime(msg.ts) }}</div>
@@ -66,7 +67,13 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { renderAiMessage } from '../utils/renderMessage.js'
+
+// 供模板 v-html 使用；图片加载完成后让容器重新吸附到底部
+function renderAi(content) {
+  return renderAiMessage(content)
+}
 
 const props = defineProps({
   title: { type: String, required: true },
@@ -190,7 +197,22 @@ watch(
   () => scrollToBottom()
 )
 
+// 图片加载是异步的，加载完会让容器高度变化。这里通过 capture 模式
+// 监听 <img>.load 事件，加载完再贴一次底，避免新图把视口顶出去。
+function onImageLoad(e) {
+  if (e.target && e.target.tagName === 'IMG') {
+    scrollToBottom()
+  }
+}
+
+onMounted(() => {
+  const el = messageListRef.value
+  if (el) el.addEventListener('load', onImageLoad, true)
+})
+
 onBeforeUnmount(() => {
+  const el = messageListRef.value
+  if (el) el.removeEventListener('load', onImageLoad, true)
   if (currentStream.value && typeof currentStream.value.close === 'function') {
     currentStream.value.close()
   }
@@ -344,6 +366,39 @@ onBeforeUnmount(() => {
   margin: 0;
   white-space: pre-wrap;
   font-family: inherit;
+}
+
+/* AI 气泡里的 Markdown 渲染样式 */
+.bubble-text.markdown {
+  display: block;
+}
+.bubble-text.markdown :deep(.chat-img) {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  margin: 8px 0;
+  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  background: #f8fafc;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+.bubble-text.markdown :deep(.chat-link) {
+  color: #4f6bff;
+  text-decoration: underline;
+  word-break: break-all;
+}
+.bubble-text.markdown :deep(code) {
+  background: #f1f5f9;
+  color: #b91c1c;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.bubble-text.markdown :deep(strong) {
+  color: inherit;
+  font-weight: 600;
 }
 
 /* 打字光标：流式进行中一闪一闪 */
