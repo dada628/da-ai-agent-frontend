@@ -10,6 +10,14 @@
         </div>
       </div>
       <button class="clear-btn" @click="handleClear">清空对话</button>
+      <button
+        v-if="structuredStream && loading && activeRunId"
+        type="button"
+        class="cancel-btn"
+        @click="handleCancelRun"
+      >
+        中止
+      </button>
     </header>
 
     <main class="messages" ref="messageListRef">
@@ -31,6 +39,22 @@
             </template>
             <template v-else-if="msg.role === 'ai'">
               <div class="bubble-text markdown" v-html="renderAi(msg.content)"></div>
+              <div v-if="msg.toolCalls?.length" class="tool-call-bar">
+                <span class="tc-label">调用工具</span>
+                <span v-for="(t, idx) in msg.toolCalls" :key="idx" class="tc-chip">{{ t.name }}</span>
+              </div>
+              <div v-for="art in msg.artifacts || []" :key="art.id" class="artifact-card" :class="'kind-' + (art.kind || 'text')">
+                <div class="artifact-head">
+                  <span class="artifact-name">{{ art.name }}</span>
+                  <span class="artifact-kind">{{ art.kind }}</span>
+                  <span v-if="art.ok === false" class="artifact-err">失败</span>
+                </div>
+                <a v-if="art.url && (art.kind === 'image' || art.kind === 'pdf')" :href="art.url" target="_blank" rel="noopener" class="artifact-dl">打开 / 下载</a>
+                <img v-if="art.kind === 'image' && art.url" :src="art.url" class="artifact-img" alt="" />
+                <iframe v-else-if="art.kind === 'pdf' && art.url" class="artifact-pdf" :src="art.url" title="pdf" />
+                <div v-else-if="art.kind === 'markdown'" class="artifact-md markdown" v-html="renderAi(art.preview || '')"></div>
+                <pre v-else class="artifact-pre">{{ art.preview }}</pre>
+              </div>
               <span v-if="msg.pending === 'streaming'" class="caret">▍</span>
             </template>
             <template v-else>
@@ -47,6 +71,7 @@
 
     <footer class="input-bar">
       <textarea
+        ref="inputRef"
         v-model="input"
         class="input"
         rows="1"
@@ -54,6 +79,14 @@
         @keydown="handleKeydown"
         :disabled="loading"
       ></textarea>
+      <button
+        v-if="structuredStream && !loading && lastUserText"
+        type="button"
+        class="retry-btn"
+        @click="handleRetry"
+      >
+        编辑并重试
+      </button>
       <button
         class="send"
         :style="{ background: themeColor }"
@@ -82,17 +115,22 @@ const props = defineProps({
   chatId: { type: String, default: '' },
   emptyTitle: { type: String, default: '开始新的对话吧' },
   emptyDesc: { type: String, default: '输入你的问题，AI 会实时流式回答' },
-  // 父组件提供：(message, { onChunk, onDone, onError }) => EventSource | { close(): void }
+  // 父组件提供：(message, { onChunk, onDone, onError, onStructured? }) => EventSource | { close(): void }
   sendFn: { type: Function, required: true },
+  /** Manus：后端推送 meta/plan/think/tool_call/tool_result/final 命名事件 */
+  structuredStream: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['clear'])
+const emit = defineEmits(['clear', 'plan-update', 'run-meta'])
 
 const input = ref('')
 const messages = ref([])
 const loading = ref(false)
 const currentStream = ref(null)
 const messageListRef = ref(null)
+const inputRef = ref(null)
+const activeRunId = ref('')
+const lastUserText = ref('')
 
 const canSend = computed(() => input.value.trim().length > 0 && !loading.value)
 
@@ -129,12 +167,106 @@ function handleKeydown(e) {
   }
 }
 
+function handleRetry() {
+  if (!lastUserText.value || loading.value) return
+  const last = messages.value[messages.value.length - 1]
+  if (last && last.role === 'ai') {
+    messages.value.pop()
+  }
+  const prev = messages.value[messages.value.length - 1]
+  if (prev && prev.role === 'user' && prev.content === lastUserText.value) {
+    messages.value.pop()
+  }
+  input.value = lastUserText.value
+  nextTick(() => {
+    const el = inputRef.value
+    if (el && typeof el.focus === 'function') {
+      el.focus()
+      if (typeof el.setSelectionRange === 'function') {
+        const len = input.value.length
+        el.setSelectionRange(len, len)
+      }
+    }
+  })
+}
+
+function buildStreamHandlers(aiMsg) {
+  const onChunk = (chunk) => {
+    if (!chunk) return
+    aiMsg.pending = 'streaming'
+    aiMsg.content += chunk
+    scrollToBottom()
+  }
+  const onDone = () => {
+    aiMsg.pending = 'done'
+    if (!aiMsg.content && !(aiMsg.artifacts && aiMsg.artifacts.length)) aiMsg.content = '(无内容)'
+    loading.value = false
+    currentStream.value = null
+    activeRunId.value = ''
+  }
+  const onError = (err) => {
+    aiMsg.pending = 'done'
+    const msg = typeof err === 'string' ? err : '请求失败，请检查后端是否在运行'
+    if (!aiMsg.content) aiMsg.content = `（出错了：${msg}）`
+    loading.value = false
+    currentStream.value = null
+    activeRunId.value = ''
+  }
+  if (!props.structuredStream) {
+    return { onChunk, onDone, onError }
+  }
+  const onStructured = (type, data) => {
+    if (type === 'meta') {
+      try {
+        const j = JSON.parse(data)
+        if (j.runId) {
+          activeRunId.value = j.runId
+          emit('run-meta', j)
+        }
+      } catch {
+        /* ignore */
+      }
+    } else if (type === 'plan') {
+      try {
+        emit('plan-update', JSON.parse(data))
+      } catch {
+        emit('plan-update', null)
+      }
+    } else if (type === 'think') {
+      onChunk(data)
+    } else if (type === 'tool_call') {
+      try {
+        const j = JSON.parse(data)
+        aiMsg.toolCalls = Array.isArray(j.tools) ? j.tools : []
+      } catch {
+        aiMsg.toolCalls = []
+      }
+    } else if (type === 'tool_result') {
+      try {
+        const j = JSON.parse(data)
+        aiMsg.artifacts.push({
+          id: uid(),
+          name: j.name || 'tool',
+          kind: j.kind || 'text',
+          ok: j.ok !== false,
+          preview: j.preview || '',
+          url: j.url || '',
+        })
+        scrollToBottom()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return { onChunk, onDone, onError, onStructured }
+}
+
 function handleSend() {
   if (!canSend.value) return
   const text = input.value.trim()
   input.value = ''
+  lastUserText.value = text
 
-  // 用户消息：普通对象 push 进响应式数组即可
   messages.value.push({
     id: uid(),
     role: 'user',
@@ -142,44 +274,36 @@ function handleSend() {
     ts: Date.now(),
   })
 
-  // AI 消息：用 reactive() 把整个对象变成响应式代理，
-  // 这样之后无论从哪里持有 aiMsg 的引用，aiMsg.content += chunk 都会触发重新渲染
-  // 状态机：
-  //   waiting   - 已发请求，等第一个 chunk（显示三个点）
-  //   streaming - 正在持续接收（显示闪烁光标）
-  //   done      - 完成（无光标）
   const aiMsg = reactive({
     id: uid(),
     role: 'ai',
     content: '',
     pending: 'waiting',
     ts: Date.now(),
+    artifacts: [],
+    toolCalls: [],
   })
   messages.value.push(aiMsg)
   scrollToBottom(true)
 
   loading.value = true
-  currentStream.value = props.sendFn(text, {
-    onChunk: (chunk) => {
-      if (!chunk) return
-      aiMsg.pending = 'streaming'
-      aiMsg.content += chunk
-      scrollToBottom() // 自动跟随（用户滚到上面看历史时不会打扰）
-    },
-    onDone: () => {
-      aiMsg.pending = 'done'
-      if (!aiMsg.content) aiMsg.content = '(无内容)'
-      loading.value = false
-      currentStream.value = null
-    },
-    onError: (err) => {
-      aiMsg.pending = 'done'
-      const msg = typeof err === 'string' ? err : '请求失败，请检查后端是否在运行'
-      if (!aiMsg.content) aiMsg.content = `（出错了：${msg}）`
-      loading.value = false
-      currentStream.value = null
-    },
-  })
+  activeRunId.value = ''
+
+  const h = buildStreamHandlers(aiMsg)
+  currentStream.value = props.sendFn(text, h)
+}
+
+async function handleCancelRun() {
+  const id = activeRunId.value
+  if (!id) return
+  try {
+    await fetch(`/api/ai/manus/cancel?runId=${encodeURIComponent(id)}`, {
+      method: 'POST',
+      credentials: 'include',
+    })
+  } catch {
+    /* noop */
+  }
 }
 
 function handleClear() {
@@ -234,6 +358,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
   padding: 14px 20px;
   color: #fff;
 }
@@ -283,6 +409,118 @@ onBeforeUnmount(() => {
 }
 .clear-btn:hover {
   background: rgba(255, 255, 255, 0.18);
+}
+
+.cancel-btn {
+  margin-left: 8px;
+  border: 1px solid rgba(255, 60, 60, 0.85);
+  background: rgba(255, 255, 255, 0.95);
+  color: #b91c1c;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.cancel-btn:hover {
+  background: #fee2e2;
+}
+
+.retry-btn {
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  color: #475569;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.retry-btn:hover {
+  border-color: #94a3b8;
+  background: #f8fafc;
+}
+
+.tool-call-bar {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: #f1f5f9;
+  border-radius: 8px;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.tc-label {
+  color: #64748b;
+  font-weight: 600;
+}
+.tc-chip {
+  background: #e0e7ff;
+  color: #3730a3;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.artifact-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #fafafa;
+  font-size: 13px;
+}
+.artifact-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.artifact-name {
+  font-weight: 600;
+  color: #0f172a;
+}
+.artifact-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #64748b;
+}
+.artifact-err {
+  color: #b91c1c;
+  font-size: 12px;
+}
+.artifact-dl {
+  display: inline-block;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.artifact-img {
+  display: block;
+  max-width: 100%;
+  max-height: 360px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+.artifact-pdf {
+  width: 100%;
+  height: 320px;
+  border: none;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.artifact-md {
+  max-height: 280px;
+  overflow: auto;
+}
+.artifact-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  max-height: 200px;
+  overflow: auto;
 }
 
 .messages {
